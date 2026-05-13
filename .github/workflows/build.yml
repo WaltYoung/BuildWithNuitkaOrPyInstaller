@@ -1,4 +1,4 @@
-name: Build and Release with Nuitka
+name: Build with Nuitka
 
 on:
   workflow_dispatch:
@@ -61,7 +61,7 @@ jobs:
           python-version: ${{ github.event.inputs.python_version }}
 
       - name: Install dependencies
-        shell: bash   # 强制使用 bash，避免 Windows 上 PowerShell 报错
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install nuitka
@@ -75,19 +75,36 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == macos-* ]]; then
-            # macOS：必须使用 app bundle 模式以支持 Foundation 等系统框架
+            # macOS 使用 app bundle 模式（支持 Foundation 等框架）
             python -m nuitka --standalone --macos-create-app-bundle \
-              --output-filename=${{ matrix.artifact_name }} \
-              ${{ matrix.nuitka_extra }} \
               --assume-yes-for-downloads \
+              ${{ matrix.nuitka_extra }} \
               ${{ github.event.inputs.entry_point }}
+            # 注意：不加 --output-filename，因为该参数对 app bundle 无效
           else
-            # Windows / Linux：普通 onefile 可执行文件
+            # Windows / Linux 使用 onefile 可执行文件
             python -m nuitka --standalone --onefile \
               --output-filename=${{ matrix.artifact_name }} \
               ${{ matrix.nuitka_extra }} \
               --assume-yes-for-downloads \
               ${{ github.event.inputs.entry_point }}
+          fi
+
+      - name: Rename macOS app bundle to expected name
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # 获取实际生成的 .app 文件夹名称（入口脚本名）
+          ENTRY_BASENAME=$(basename "${{ github.event.inputs.entry_point }}" .py)
+          ACTUAL_APP="${ENTRY_BASENAME}.app"
+          EXPECTED_APP="${{ matrix.artifact_name }}"
+          if [ -d "$ACTUAL_APP" ]; then
+            echo "Found $ACTUAL_APP, renaming to $EXPECTED_APP"
+            mv "$ACTUAL_APP" "$EXPECTED_APP"
+          else
+            echo "ERROR: Expected app bundle '$ACTUAL_APP' not found!"
+            ls -la
+            exit 1
           fi
 
       - name: Upload artifact
