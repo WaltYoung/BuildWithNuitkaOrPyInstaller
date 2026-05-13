@@ -1,7 +1,7 @@
-name: Build and Release with Nuitka (Manual)
+name: Build and Release with Nuitka
 
 on:
-  workflow_dispatch:                      # 允许手动触发
+  workflow_dispatch:
     inputs:
       python_version:
         description: 'Python 版本 (例如 3.12, 3.11)'
@@ -24,21 +24,20 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: myapp-windows.exe
-            nuitka_extra: --windows-console-mode=disable   # 可选：隐藏控制台窗口
+            nuitka_extra: --windows-console-mode=disable
           - os: ubuntu-22.04
             artifact_name: myapp-linux
             nuitka_extra: ''
           - os: macos-latest
-            artifact_name: myapp-macos
+            artifact_name: myapp-macos.app
             nuitka_extra: ''
-      fail-fast: false                      # 一个平台失败不影响其他平台
+      fail-fast: false
 
     steps:
       - name: Parse repository input
         id: parse_repo
         run: |
           REPO_INPUT="${{ github.event.inputs.repo_url }}"
-          # 如果输入是完整 URL，提取 owner/repo；否则直接使用输入
           if [[ "$REPO_INPUT" =~ github\.com[:/](.+)/(.+)\.git$ ]]; then
             OWNER_REPO="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
           elif [[ "$REPO_INPUT" =~ ^https?://github\.com/(.+)/(.+)$ ]]; then
@@ -53,8 +52,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.parse_repo.outputs.owner_repo }}
-          # 对于公共仓库，无需 token；私有仓库需要配置 personal access token
-          # token: ${{ secrets.USER_REPO_TOKEN }}   # 可选，按需添加
+          # 如需构建私有仓库，请在 Secrets 中添加 REPO_ACCESS_TOKEN 并取消下行注释
+          # token: ${{ secrets.REPO_ACCESS_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -62,6 +61,7 @@ jobs:
           python-version: ${{ github.event.inputs.python_version }}
 
       - name: Install dependencies
+        shell: bash   # 强制使用 bash，避免 Windows 上 PowerShell 报错
         run: |
           python -m pip install --upgrade pip
           pip install nuitka
@@ -72,13 +72,23 @@ jobs:
           fi
 
       - name: Build with Nuitka
-        run: |
-          python -m nuitka --standalone --onefile \
-                 --output-filename=${{ matrix.artifact_name }} \
-                 ${{ matrix.nuitka_extra }} \
-                 --assume-yes-for-downloads \
-                 ${{ github.event.inputs.entry_point }}
         shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == macos-* ]]; then
+            # macOS：必须使用 app bundle 模式以支持 Foundation 等系统框架
+            python -m nuitka --standalone --macos-create-app-bundle \
+              --output-filename=${{ matrix.artifact_name }} \
+              ${{ matrix.nuitka_extra }} \
+              --assume-yes-for-downloads \
+              ${{ github.event.inputs.entry_point }}
+          else
+            # Windows / Linux：普通 onefile 可执行文件
+            python -m nuitka --standalone --onefile \
+              --output-filename=${{ matrix.artifact_name }} \
+              ${{ matrix.nuitka_extra }} \
+              --assume-yes-for-downloads \
+              ${{ github.event.inputs.entry_point }}
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
