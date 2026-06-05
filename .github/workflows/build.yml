@@ -1,4 +1,4 @@
-name: Build with Nuitka
+name: Build Python Application
 
 on:
   workflow_dispatch:
@@ -11,13 +11,20 @@ on:
         description: 'GitHub 仓库地址或 "owner/repo" 格式 (例如 https://github.com/user/repo 或 user/repo)'
         required: true
       entry_point:
-        description: '入口脚本文件 (相对于仓库根目录的路径)'
+        description: '入口脚本文件 (可选，留空则自动检测)'
+        required: false
+        default: ''
+      builder:
+        description: '打包工具'
         required: true
-        default: 'main.py'
+        type: choice
+        options:
+          - Nuitka
+          - PyInstaller
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build with ${{ github.event.inputs.builder }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -25,15 +32,22 @@ jobs:
           - os: windows-latest
             artifact_name: myapp-windows.exe
             nuitka_extra: --windows-console-mode=disable
+            pyinstaller_sep: ';'
+            pyinstaller_console: --noconsole
           - os: ubuntu-22.04
             artifact_name: myapp-linux
             nuitka_extra: ''
+            pyinstaller_sep: ':'
+            pyinstaller_console: --console
           - os: macos-latest
-            artifact_name: myapp-macos.app
+            artifact_name: myapp-macos.app      # Nuitka 输出 app bundle
             nuitka_extra: ''
+            pyinstaller_sep: ':'
+            pyinstaller_console: --console
       fail-fast: false
 
     steps:
+      # 1. 解析仓库地址
       - name: Parse repository input
         id: parse_repo
         run: |
@@ -48,6 +62,7 @@ jobs:
           echo "owner_repo=$OWNER_REPO" >> $GITHUB_OUTPUT
         shell: bash
 
+      # 2. 检出用户仓库
       - name: Checkout user repository
         uses: actions/checkout@v4
         with:
@@ -55,47 +70,104 @@ jobs:
           # 如需构建私有仓库，请在 Secrets 中添加 REPO_ACCESS_TOKEN 并取消下行注释
           # token: ${{ secrets.REPO_ACCESS_TOKEN }}
 
+      # 3. 设置 Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ github.event.inputs.python_version }}
 
+      # 4. 安装依赖（公共依赖 + 对应打包工具）
       - name: Install dependencies
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install nuitka
+          if [ "${{ github.event.inputs.builder }}" = "Nuitka" ]; then
+            pip install nuitka
+          else
+            pip install pyinstaller
+          fi
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
             echo "No requirements.txt found, skipping."
           fi
 
+      # 5. 确定入口脚本（用户提供或自动检测）
+      - name: Determine entry point
+        id: entry
+        run: |
+          USER_ENTRY="${{ github.event.inputs.entry_point }}"
+          if [ -n "$USER_ENTRY" ] && [ -f "$USER_ENTRY" ]; then
+            echo "Using user-provided entry point: $USER_ENTRY"
+            echo "entry=$USER_ENTRY" >> $GITHUB_OUTPUT
+          else
+            echo "User entry not provided or not found, auto-detecting..."
+            # 自动检测逻辑（来自 PyInstaller 的简化版，适用于 Nuitka 和 PyInstaller）
+            python - << 'EOF'
+            import ast
+            from pathlib import Path
+            import sys
+
+            possible_entries = ['main.py', 'app.py', 'run.py', '__main__.py', 'cli.py', 'start.py']
+            entry = None
+            for candidate in possible_entries:
+                if Path(candidate).exists():
+                    entry = candidate
+                    break
+            if not entry:
+                # 查找任何包含 if __name__ == "__main__" 的 .py 文件
+                for py_file in Path('.').glob('*.py'):
+                    try:
+                        code = py_file.read_text(encoding='utf-8')
+                        tree = ast.parse(code)
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.If):
+                                # 简单检查 __name__ == "__main__"
+                                if (isinstance(node.test, ast.Compare) and
+                                    isinstance(node.test.left, ast.Name) and
+                                    node.test.left.id == '__name__'):
+                                    entry = str(py_file)
+                                    break
+                        if entry:
+                            break
+                    except:
+                        continue
+            if not entry:
+                print("No entry script found!")
+                sys.exit(1)
+            # 输出检测到的入口
+            with open(Path(os.environ['GITHUB_OUTPUT']), 'a') as f:
+                f.write(f"entry={entry}\n")
+            EOF
+          fi
+        shell: bash
+
+      # ========== Nuitka 构建 ==========
       - name: Build with Nuitka
+        if: github.event.inputs.builder == 'Nuitka'
         shell: bash
         run: |
+          ENTRY="${{ steps.entry.outputs.entry }}"
           if [[ "${{ matrix.os }}" == macos-* ]]; then
-            # macOS 使用 app bundle 模式（支持 Foundation 等框架）
+            # macOS 使用 app bundle 模式
             python -m nuitka --standalone --macos-create-app-bundle \
               --assume-yes-for-downloads \
               ${{ matrix.nuitka_extra }} \
-              ${{ github.event.inputs.entry_point }}
-            # 注意：不加 --output-filename，因为该参数对 app bundle 无效
+              "$ENTRY"
           else
             # Windows / Linux 使用 onefile 可执行文件
             python -m nuitka --standalone --onefile \
               --output-filename=${{ matrix.artifact_name }} \
               ${{ matrix.nuitka_extra }} \
               --assume-yes-for-downloads \
-              ${{ github.event.inputs.entry_point }}
+              "$ENTRY"
           fi
 
-      - name: Rename macOS app bundle to expected name
-        if: runner.os == 'macOS'
+      - name: Rename macOS app bundle (Nuitka)
+        if: github.event.inputs.builder == 'Nuitka' && runner.os == 'macOS'
         shell: bash
         run: |
-          # 获取实际生成的 .app 文件夹名称（入口脚本名）
-          ENTRY_BASENAME=$(basename "${{ github.event.inputs.entry_point }}" .py)
+          ENTRY_BASENAME=$(basename "${{ steps.entry.outputs.entry }}" .py)
           ACTUAL_APP="${ENTRY_BASENAME}.app"
           EXPECTED_APP="${{ matrix.artifact_name }}"
           if [ -d "$ACTUAL_APP" ]; then
@@ -107,8 +179,105 @@ jobs:
             exit 1
           fi
 
-      - name: Upload artifact
+      # ========== PyInstaller 构建 ==========
+      # 6. 自动分析导入模块（仅 PyInstaller）
+      - name: Analyze imports for PyInstaller
+        if: github.event.inputs.builder == 'PyInstaller'
+        id: pyi_analysis
+        run: |
+          python - << 'EOF'
+          import ast
+          import os
+          import sys
+          from pathlib import Path
+          import subprocess
+          import json
+
+          ENTRY = "${{ steps.entry.outputs.entry }}"
+          if not ENTRY:
+              print("Entry point not set")
+              sys.exit(1)
+
+          # 分析整个项目的导入
+          imports = set()
+          for py_file in Path('.').rglob('*.py'):
+              try:
+                  code = py_file.read_text(encoding='utf-8')
+                  tree = ast.parse(code)
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.Import):
+                          for alias in node.names:
+                              imports.add(alias.name.split('.')[0])
+                      elif isinstance(node, ast.ImportFrom):
+                          if node.module:
+                              imports.add(node.module.split('.')[0])
+              except:
+                  continue
+
+          # 获取已安装的包
+          result = subprocess.run([sys.executable, '-m', 'pip', 'freeze'], capture_output=True, text=True)
+          installed_pkgs = {}
+          for line in result.stdout.splitlines():
+              if '==' in line:
+                  pkg, ver = line.split('==', 1)
+                  installed_pkgs[pkg.lower()] = pkg
+
+          # 定义需要完整打包的框架
+          heavy_frameworks = {
+              'streamlit': 'streamlit',
+              'plotly': 'plotly',
+              'django': 'django',
+              'pyqt5': 'PyQt5',
+              'pyside6': 'PySide6',
+              'flask': 'flask',
+              'tornado': 'tornado',
+          }
+
+          collect_args = []
+          hidden_args = []
+
+          for imp in imports:
+              imp_lower = imp.lower()
+              if imp_lower in heavy_frameworks:
+                  pkg = heavy_frameworks[imp_lower]
+                  collect_args.append(f"--collect-all {pkg}")
+                  print(f"Will collect-all: {pkg}")
+              elif imp_lower in installed_pkgs:
+                  hidden_args.append(f"--hidden-import {installed_pkgs[imp_lower]}")
+                  print(f"Will hide import: {installed_pkgs[imp_lower]}")
+
+          collect_args = list(set(collect_args))
+          hidden_args = list(set(hidden_args))
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"collect_args={' '.join(collect_args)}\n")
+              f.write(f"hidden_args={' '.join(hidden_args)}\n")
+          EOF
+        shell: bash
+
+      - name: Build with PyInstaller
+        if: github.event.inputs.builder == 'PyInstaller'
+        run: |
+          pyinstaller --onefile \
+            --name ${{ matrix.artifact_name }} \
+            --add-data "${{ steps.entry.outputs.entry }}${{ matrix.pyinstaller_sep }}." \
+            ${{ steps.pyi_analysis.outputs.hidden_args }} \
+            ${{ steps.pyi_analysis.outputs.collect_args }} \
+            ${{ matrix.pyinstaller_console }} \
+            ${{ steps.entry.outputs.entry }}
+        shell: bash
+
+      # 7. 上传产物
+      - name: Upload artifact (Nuitka)
+        if: github.event.inputs.builder == 'Nuitka'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}
+
+      - name: Upload artifact (PyInstaller)
+        if: github.event.inputs.builder == 'PyInstaller'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
